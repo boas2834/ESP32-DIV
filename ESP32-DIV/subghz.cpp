@@ -425,7 +425,8 @@ static bool subghzWaitWithNav(uint32_t ms) {
 }
 
 static void subghzSetReplayNavLabels() {
-  setTouchNavLabels("Freq-", "Save", "Exit", "Send", "Freq+");
+  // DOWN is "Save" once a signal is captured, otherwise "Band" (pre-selection).
+  setTouchNavLabels("Freq-", (receivedValue != 0) ? "Save" : "Band", "Exit", "Send", "Freq+");
 }
 
 static void subghzSetJammerNavLabels() {
@@ -467,6 +468,7 @@ void runUI();
 void sendSignal();
 void saveProfile();
 void updateDisplay();
+static void replayInvalidateDisplay();
 
 #define MAX_NAME_LENGTH 16
 
@@ -545,6 +547,33 @@ static const uint32_t subghz_frequency_list[] = {
 
 uint16_t currentFrequencyIndex = 0;
 int yshift = 20;
+
+// --- frequency band pre-selection ------------------------------------------
+// Each band is a contiguous index window into subghz_frequency_list (which is
+// sorted ascending). Freq-/Freq+ and the auto-scan stay inside the chosen band.
+struct ReplayBand { const char* name; const char* tag; uint8_t lo, hi, def; };
+static const ReplayBand kReplayBands[] = {
+    {"433 MHz EU", "EU4",  9, 13, 11},  // 433.075-434.775, default 433.92
+    {"868 MHz EU", "EU8", 15, 15, 15},  // 868.35
+    {"315 MHz US", "US3",  3,  6,  5},  // 310-318, default 315
+    {"915 MHz US", "US9", 16, 17, 16},  // 915 / 925
+    {"Alle",       "ALL",  0, 17, 11},  // full list
+};
+static const uint8_t kReplayBandCount = sizeof(kReplayBands) / sizeof(kReplayBands[0]);
+static uint8_t currentBandIndex = 0;    // default 433 MHz EU
+static inline const ReplayBand& curBand() { return kReplayBands[currentBandIndex]; }
+static inline uint16_t bandClampIdx(uint16_t idx) {
+    const ReplayBand& b = curBand();
+    return (idx < b.lo || idx > b.hi) ? b.def : idx;
+}
+static inline uint16_t bandNextIdx(uint16_t idx) {
+    const ReplayBand& b = curBand();
+    return (idx < b.lo || idx >= b.hi) ? b.lo : (uint16_t)(idx + 1);
+}
+static inline uint16_t bandPrevIdx(uint16_t idx) {
+    const ReplayBand& b = curBand();
+    return (idx <= b.lo || idx > b.hi) ? b.hi : (uint16_t)(idx - 1);
+}
 
 static bool autoScanEnabled = false;
 static uint16_t scanIndex = 0;
@@ -715,7 +744,7 @@ static void replayScanHopTo(uint16_t idx, uint16_t fromIdx) {
 }
 
 static void replayBeginAutoScan() {
-  scanIndex = currentFrequencyIndex;
+  scanIndex = bandClampIdx(currentFrequencyIndex);
   lastHopMs = 0;
   scanSettledAtMs = 0;
   lastRssiSampleMs = 0;
@@ -766,18 +795,41 @@ static void replaySampleRssiForScan(uint32_t now) {
   lastRssiSampleMs = now;
 }
 
+// Tuning off the captured frequency makes the old capture stale, so clear it
+// (this also re-exposes the "Band" button once nothing is captured).
+static void replayClearCapture() {
+  receivedValue = 0;
+  receivedBitLength = 0;
+  receivedProtocol = 0;
+  subghzSetReplayNavLabels();
+}
+
 static void replayFreqNext() {
   autoScanEnabled = false;
   replayClearScanLock();
-  tuneToIndex((uint16_t)((currentFrequencyIndex + 1) % freqCount()), true);
+  replayClearCapture();
+  tuneToIndex(bandNextIdx(currentFrequencyIndex), true);
   updateDisplay();
 }
 
 static void replayFreqPrev() {
   autoScanEnabled = false;
   replayClearScanLock();
-  tuneToIndex((uint16_t)((currentFrequencyIndex + freqCount() - 1) % freqCount()), true);
+  replayClearCapture();
+  tuneToIndex(bandPrevIdx(currentFrequencyIndex), true);
   updateDisplay();
+}
+
+// Cycle to the next frequency band and jump to its default frequency.
+static void replayCycleBand() {
+  currentBandIndex = (uint8_t)((currentBandIndex + 1) % kReplayBandCount);
+  autoScanEnabled = false;
+  replayClearScanLock();
+  replayClearCapture();
+  tuneToIndex(curBand().def, true);
+  replayInvalidateDisplay();
+  updateDisplay();
+  subghzRedrawNavChrome();
 }
 
 static void replayToggleAuto() {
@@ -885,14 +937,27 @@ void replayHandleNavButtons() {
     return;
   }
 
+  // Hold-to-tune: step once on the press edge, then auto-repeat while the key
+  // stays down (400ms before the first repeat, then every 110ms). No blocking
+  // wait-for-release on the frequency keys, so holding keeps stepping.
+  static uint8_t  s_freqRepDir  = 0;   // 0 idle, 1 = Freq+, 2 = Freq-
+  static uint32_t s_freqRepNext = 0;
+  const bool lLeft  = isTouchNavButtonPressed(BTN_LEFT);
+  const bool lRight = isTouchNavButtonPressed(BTN_RIGHT);
+  const uint32_t nowMs = millis();
+
   if (isTouchNavButtonPressedEdge(BTN_LEFT)) {
-    replayFreqPrev();
-    subghzWaitNavRelease(BTN_LEFT);
+    replayFreqPrev();  s_freqRepDir = 2; s_freqRepNext = nowMs + 400;
+  } else if (isTouchNavButtonPressedEdge(BTN_RIGHT)) {
+    replayFreqNext();  s_freqRepDir = 1; s_freqRepNext = nowMs + 400;
+  } else if (s_freqRepDir == 2 && lLeft) {
+    if ((int32_t)(nowMs - s_freqRepNext) >= 0) { replayFreqPrev(); s_freqRepNext = nowMs + 110; }
+  } else if (s_freqRepDir == 1 && lRight) {
+    if ((int32_t)(nowMs - s_freqRepNext) >= 0) { replayFreqNext(); s_freqRepNext = nowMs + 110; }
+  } else {
+    s_freqRepDir = 0;
   }
-  if (isTouchNavButtonPressedEdge(BTN_RIGHT)) {
-    replayFreqNext();
-    subghzWaitNavRelease(BTN_RIGHT);
-  }
+
   if (isTouchNavButtonPressedEdge(BTN_UP)) {
     if (receivedValue != 0) {
       autoScanEnabled = false;
@@ -902,7 +967,8 @@ void replayHandleNavButtons() {
     subghzWaitNavRelease(BTN_UP);
   }
   if (isTouchNavButtonPressedEdge(BTN_DOWN)) {
-    replayTrySave();
+    if (receivedValue != 0) replayTrySave();   // signal captured -> Save
+    else                    replayCycleBand(); // nothing captured -> cycle Band
     subghzWaitNavRelease(BTN_DOWN);
   }
 }
@@ -919,8 +985,8 @@ void updateDisplay() {
     char ptcBuf[8];
     char valBuf[16];
 
-    snprintf(freqBuf, sizeof(freqBuf), "%.2f MHz",
-             subghz_frequency_list[currentFrequencyIndex] / 1000000.0);
+    snprintf(freqBuf, sizeof(freqBuf), "%.2f %s",
+             subghz_frequency_list[currentFrequencyIndex] / 1000000.0, curBand().tag);
     if (modeState == 2) {
       snprintf(modeBuf, sizeof(modeBuf), "LOCK");
     } else {
@@ -1248,16 +1314,10 @@ void runUI() {
 
             switch (activeIcon) {
                 case 0:
-                    autoScanEnabled = false;
-                    currentFrequencyIndex = (currentFrequencyIndex + 1) % (sizeof(subghz_frequency_list) / sizeof(subghz_frequency_list[0]));
-                    tuneToIndex(currentFrequencyIndex, true);
-                    updateDisplay();
+                    replayFreqNext();   // band-aware + clears stale capture
                     break;
                 case 1:
-                    autoScanEnabled = false;
-                    currentFrequencyIndex = (currentFrequencyIndex - 1 + (sizeof(subghz_frequency_list) / sizeof(subghz_frequency_list[0]))) % (sizeof(subghz_frequency_list) / sizeof(subghz_frequency_list[0]));
-                    tuneToIndex(currentFrequencyIndex, true);
-                    updateDisplay();
+                    replayFreqPrev();   // band-aware + clears stale capture
                     break;
                 case 2:
                     sendSignal();
@@ -1343,6 +1403,8 @@ void ReplayAttackSetup() {
 
   const uint16_t freqCount = (uint16_t)(sizeof(subghz_frequency_list) / sizeof(subghz_frequency_list[0]));
   if (currentFrequencyIndex >= freqCount) currentFrequencyIndex = 0;
+  currentFrequencyIndex = bandClampIdx(currentFrequencyIndex);  // keep freq inside the selected band
+  subghzSetReplayNavLabels();  // now that receivedValue is loaded, pick Save vs Band for DOWN
 
   autoScanEnabled = false;
   replayClearScanLock();
@@ -1499,13 +1561,17 @@ void ReplayAttackLoop() {
       subghzRedrawNavChrome();
     }
 
-    if (rightPressed && !prevRight && millis() - lastDebounceTime > debounceDelay) {
-        replayFreqNext();
-        lastDebounceTime = millis();
-    }
-    if (leftPressed && !prevLeft && millis() - lastDebounceTime > debounceDelay) {
-        replayFreqPrev();
-        lastDebounceTime = millis();
+    // Freq+/Freq- with hold-to-repeat on the physical buttons (step on the
+    // press edge, then auto-repeat after 400ms every 110ms while held).
+    {
+        static uint8_t  s_pFreqDir  = 0;   // 0 idle, 1 = Freq+, 2 = Freq-
+        static uint32_t s_pFreqNext = 0;
+        const uint32_t pNow = millis();
+        if (rightPressed && !prevRight)      { replayFreqNext(); s_pFreqDir = 1; s_pFreqNext = pNow + 400; }
+        else if (leftPressed && !prevLeft)   { replayFreqPrev(); s_pFreqDir = 2; s_pFreqNext = pNow + 400; }
+        else if (s_pFreqDir == 1 && rightPressed) { if ((int32_t)(pNow - s_pFreqNext) >= 0) { replayFreqNext(); s_pFreqNext = pNow + 110; } }
+        else if (s_pFreqDir == 2 && leftPressed)  { if ((int32_t)(pNow - s_pFreqNext) >= 0) { replayFreqPrev(); s_pFreqNext = pNow + 110; } }
+        else if (!rightPressed && !leftPressed)   { s_pFreqDir = 0; }
     }
     if (upPressed && !prevUp && receivedValue != 0 && millis() - lastDebounceTime > debounceDelay) {
         autoScanEnabled = false;
@@ -1514,7 +1580,8 @@ void ReplayAttackLoop() {
         lastDebounceTime = millis();
     }
     if (downPressed && !prevDown && millis() - lastDebounceTime > debounceDelay) {
-        replayTrySave();
+        if (receivedValue != 0) replayTrySave();   // captured -> Save
+        else                    replayCycleBand(); // nothing captured -> cycle Band
         lastDebounceTime = millis();
     }
 
@@ -1530,7 +1597,7 @@ void ReplayAttackLoop() {
       if (!scanLocked &&
           (lastHopMs == 0 || (now - lastHopMs) >= replayScanDwellMs())) {
         const uint16_t fromIdx = currentFrequencyIndex;
-        scanIndex = (uint16_t)((scanIndex + 1) % freqCount());
+        scanIndex = bandNextIdx(scanIndex);
         replayScanHopTo(scanIndex, fromIdx);
         lastHopMs = now;
         rssiHot = false;
@@ -1573,11 +1640,12 @@ void ReplayAttackLoop() {
           EEPROM.put(ADDR_PROTO, receivedProtocol);
           EEPROM.commit();
 
+          subghzSetReplayNavLabels();   // signal captured -> DOWN becomes "Save"
           updateDisplay();
 
           if (autoScanEnabled) {
             lockUntilMs = now + LOCK_HOLD_MS;
-            scanIndex = currentFrequencyIndex;
+            scanIndex = bandClampIdx(currentFrequencyIndex);
             rssiHot = false;
             rssiDetectStreak = 0;
 
