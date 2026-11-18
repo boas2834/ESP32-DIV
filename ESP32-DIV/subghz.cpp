@@ -424,6 +424,8 @@ static bool subghzWaitWithNav(uint32_t ms) {
   return true;
 }
 
+extern uint32_t receivedValue;  // defined later in this TU
+
 static void subghzSetReplayNavLabels() {
   // DOWN is "Save" once a signal is captured, otherwise "Band" (pre-selection).
   setTouchNavLabels("Freq-", (receivedValue != 0) ? "Save" : "Band", "Exit", "Send", "Freq+");
