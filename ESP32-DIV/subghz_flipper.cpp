@@ -10,6 +10,7 @@
 // or exits at the root.
 
 #include <Arduino.h>
+#include <esp_task_wdt.h>
 #include <algorithm>
 #include <vector>
 #include <string>
@@ -47,6 +48,7 @@ static String             s_status;
 static String      s_filePath;                   // full SD path of opened .sub
 static SubFlip::SubFile s_parsed;
 static bool        s_parsedOk = false;
+static bool        s_fileTooBig = false;          // file exceeded the read cap
 
 // auto-repeat scroll
 static bool     s_repActive = false;
@@ -119,7 +121,9 @@ static void scanDir() {
     s_first = 0;
 }
 
-static bool readFileToString(const String& path, std::string& out, size_t cap = 96 * 1024) {
+static bool readFileToString(const String& path, std::string& out, bool& truncated,
+                             size_t cap = 64 * 1024) {
+    truncated = false;
     File f = SD.open(path.c_str(), FILE_READ);
     if (!f) return false;
     out.clear();
@@ -129,14 +133,39 @@ static bool readFileToString(const String& path, std::string& out, size_t cap = 
         if (n <= 0) break;
         out.append((const char*)buf, (size_t)n);
     }
+    if (f.available()) truncated = true;   // more data on disk than we read
     f.close();
     return true;
 }
 
 // ---- transmit --------------------------------------------------------------
+// Hold the line for `us` microseconds. Long gaps are split into chunks so the
+// value fits delayMicroseconds() well; the level is constant across the whole
+// delay, so feeding the task watchdog between chunks adds no signal distortion.
 static void sfUsDelay(uint32_t us) {
-    while (us > 16000) { delayMicroseconds(16000); us -= 16000; }
+    while (us > 8000) {
+        delayMicroseconds(8000);
+        us -= 8000;
+        esp_task_wdt_reset();   // no timing cost, level unchanged
+    }
     if (us) delayMicroseconds(us);
+}
+
+// Temporarily turn off the idle-task watchdog on whichever core the loop runs
+// on, so a long bit-banged transmit cannot trigger a reset.
+static inline void sfWdtDisable() {
+#if CONFIG_FREERTOS_UNICORE
+    disableCore0WDT();
+#else
+    disableCore1WDT();
+#endif
+}
+static inline void sfWdtEnable() {
+#if CONFIG_FREERTOS_UNICORE
+    enableCore0WDT();
+#else
+    enableCore1WDT();
+#endif
 }
 
 static void sfTxWaveform(uint32_t freqHz, const std::vector<SubGhz::LevelDuration>& w, int repeats) {
@@ -160,14 +189,19 @@ static void sfTxWaveform(uint32_t freqHz, const std::vector<SubGhz::LevelDuratio
     digitalWrite(SUBGHZ_TX_PIN, LOW);
     ELECHOUSE_cc1101.SetTx();
 
+    sfWdtDisable();
     for (int r = 0; r < repeats; ++r) {
+        size_t i = 0;
         for (const SubGhz::LevelDuration& ld : w) {
             digitalWrite(SUBGHZ_TX_PIN, ld.level ? HIGH : LOW);
             sfUsDelay(ld.duration);
+            if ((++i & 0x3F) == 0) esp_task_wdt_reset();
         }
         digitalWrite(SUBGHZ_TX_PIN, LOW);
-        if (r + 1 < repeats) delay(12);  // inter-frame gap
+        esp_task_wdt_reset();
+        if (r + 1 < repeats) { delay(12); yield(); }  // inter-frame gap, lets idle run
     }
+    sfWdtEnable();
 
     digitalWrite(SUBGHZ_TX_PIN, LOW);
     ELECHOUSE_cc1101.setSidle();
@@ -263,7 +297,9 @@ static void drawDetail() {
         }
 
         bool send = SubFlip::isSendable(f);
-        if (f.rolling)
+        if (s_fileTooBig)
+            line("Datei zu gross - nicht sendbar", UI_WARN);
+        else if (f.rolling)
             line("Rolling-Code: nur Anzeige", UI_WARN);
         else if (!send && f.mod == SubFlip::Mod::FSK)
             line("2-FSK: Senden nicht moeglich", UI_WARN);
@@ -304,7 +340,7 @@ static void openSelected() {
     // open .sub file
     s_filePath = curDirPath() + "/" + c.name;
     std::string text;
-    s_parsedOk = readFileToString(s_filePath, text);
+    s_parsedOk = readFileToString(s_filePath, text, s_fileTooBig);
     s_parsed = s_parsedOk ? SubFlip::parseString(text) : SubFlip::SubFile{};
     s_status = "";
     s_screen = Screen::Detail;
@@ -322,6 +358,11 @@ static void goUp() {
 
 static void sendCurrent() {
     if (!s_parsedOk || !s_parsed.ok) { s_status = "Ungueltige Datei"; redraw(); return; }
+    if (s_fileTooBig) {   // oversized RAW would be truncated/garbled -> refuse
+        s_status = "Datei zu gross";
+        redraw();
+        return;
+    }
     if (!SubFlip::isSendable(s_parsed)) {
         s_status = s_parsed.rolling ? "Rolling-Code: gesperrt" : "Nicht sendbar";
         redraw();
@@ -331,7 +372,7 @@ static void sendCurrent() {
     if (w.empty()) { s_status = "Nichts zu senden"; redraw(); return; }
     s_status = "Sende...";
     redraw();
-    int repeats = s_parsed.raw ? 3 : 6;   // RAW usually already repeats; fixed codes don't
+    int repeats = s_parsed.raw ? 2 : 5;   // RAW usually already repeats; fixed codes don't
     sfTxWaveform(s_parsed.frequencyHz, w, repeats);
     s_status = "Gesendet";
     redraw();
