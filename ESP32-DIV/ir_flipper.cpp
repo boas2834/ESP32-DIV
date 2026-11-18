@@ -18,6 +18,7 @@
 #include <vector>
 #include "shared.h"
 #include "utils.h"
+#include "Touchscreen.h"
 #include "ir_flipper.h"
 #include "ir_flipper_parse.h"
 #include "ir_encoders.h"
@@ -189,6 +190,30 @@ constexpr int kListTop = 44;
 constexpr int kLineH   = 16;
 constexpr int kRows    = 9;
 
+// Y of the status line: just above the touch nav bar when it's shown, so the
+// two never overlap; otherwise near the bottom of the screen.
+int statusY() {
+  int bottom = featureHasTouchNavBar() ? (int)touchNavContentBottomY() : 316;
+  return bottom - kLineH;
+}
+
+// First visible row index for a list of `count` items with cursor `sel`.
+// Kept identical to drawList() so touch hit-testing maps to the same rows.
+int listFirst(int count, int sel) {
+  int first = sel - kRows / 2;
+  if (first > count - kRows) first = count - kRows;
+  if (first < 0) first = 0;
+  return first;
+}
+
+// If a tap falls on a visible list row, return its index, else -1.
+int rowAtTouchY(int count, int sel, int ty) {
+  if (ty < kListTop || ty >= kListTop + kRows * kLineH) return -1;
+  int i = (ty - kListTop) / kLineH;
+  int idx = listFirst(count, sel) + i;
+  return (idx >= 0 && idx < count) ? idx : -1;
+}
+
 void drawHeader(const String& title) {
   tft.fillRect(0, 20, 240, 20, FEATURE_BG);
   tft.setTextSize(1);
@@ -201,9 +226,10 @@ void drawHeader(const String& title) {
 }
 
 void drawStatusLine() {
-  tft.fillRect(0, 300, 240, 16, FEATURE_BG);
+  int y = statusY();
+  tft.fillRect(0, y, 240, kLineH, FEATURE_BG);
   tft.setTextColor(UI_WARN, FEATURE_BG);
-  tft.setCursor(6, 302);
+  tft.setCursor(6, y + 2);
   String s = s_status;
   if (s.length() > 36) s = s.substring(0, 36);
   tft.print(s);
@@ -211,9 +237,7 @@ void drawStatusLine() {
 
 template <typename GetLabel>
 void drawList(int count, int sel, GetLabel label) {
-  int first = sel - kRows / 2;
-  if (first > count - kRows) first = count - kRows;
-  if (first < 0) first = 0;
+  int first = listFirst(count, sel);
   tft.fillRect(0, kListTop, 240, kRows * kLineH, FEATURE_BG);
   for (int i = 0; i < kRows; ++i) {
     int idx = first + i;
@@ -242,7 +266,13 @@ void redrawBrowse() {
       return e.isDir ? (String("[") + e.name + "]") : e.name;
     });
   }
-  s_status = "UP/DN move  RIGHT open  LEFT up";
+  if (featureHasTouchNavBar()) {
+    // slots: left, down, center, up, right
+    setTouchNavLabels(s_curDir.length() ? "Ordner+" : nullptr,
+                      "Runter", "Exit", "Hoch", "Oeffnen");
+    redrawTouchButtonBar();
+  }
+  s_status = "Oeffnen=Ordner/Datei  Ordner+=hoch";
   drawStatusLine();
 }
 
@@ -256,7 +286,11 @@ void redrawButtons() {
   String fn = slash >= 0 ? s_openFile.substring(slash + 1) : s_openFile;
   drawHeader(String("File: ") + fn);
   drawList(displayCount(), s_btnSel, displayLabel);
-  s_status = "RIGHT send  LEFT back";
+  if (featureHasTouchNavBar()) {
+    setTouchNavLabels("Zurueck", "Runter", "Exit", "Hoch", "Senden");
+    redrawTouchButtonBar();
+  }
+  s_status = "Senden  Zurueck=Liste";
   drawStatusLine();
 }
 
@@ -290,23 +324,41 @@ void loop() {
     s_dirty = false;
   }
 
-  static uint32_t lastMs = 0;
-  const uint32_t debounce = 180;
-  static bool pUp=false, pDn=false, pR=false, pL=false;
-  bool up = isPhysicalButtonPressed(BTN_UP);
-  bool dn = isPhysicalButtonPressed(BTN_DOWN);
-  bool r  = isPhysicalButtonPressed(BTN_RIGHT);
-  bool l  = isPhysicalButtonPressed(BTN_LEFT);
-  uint32_t now = millis();
+  // Edge-triggered input: isButtonPressedEdge() fires once per press for BOTH
+  // the on-screen touch nav bar and the physical PCF buttons, so every action
+  // works by touch or by button. (Exit is handled above via the center/exit
+  // slot and featureExitButtonPressed().)
+  bool up = isButtonPressedEdge(BTN_UP);
+  bool dn = isButtonPressedEdge(BTN_DOWN);
+  bool r  = isButtonPressedEdge(BTN_RIGHT);
+  bool l  = isButtonPressedEdge(BTN_LEFT);
+
+  // Direct tap on a list row: select it, and tapping the already-selected row
+  // acts on it (open folder/file in Browse, send in Buttons).
+  static uint32_t lastTapMs = 0;
+  int tapRow = -1;
+  {
+    int tx, ty;
+    uint32_t now = millis();
+    if (now - lastTapMs > 220 && readTouchXY(tx, ty)) {
+      int cnt = (s_screen == Screen::Browse) ? (int)s_entries.size() : displayCount();
+      int selNow = (s_screen == Screen::Browse) ? s_browseSel : s_btnSel;
+      tapRow = rowAtTouchY(cnt, selNow, ty);
+      if (tapRow >= 0) lastTapMs = now;
+    }
+  }
 
   if (s_screen == Screen::Browse) {
     int n = (int)s_entries.size();
-    if (dn && !pDn && now - lastMs > debounce && n) { s_browseSel = (s_browseSel+1)%n; s_dirty=true; lastMs=now; }
-    if (up && !pUp && now - lastMs > debounce && n) { s_browseSel = (s_browseSel-1+n)%n; s_dirty=true; lastMs=now; }
-    if (l && !pL && now - lastMs > debounce && s_curDir.length()) {
-      s_curDir = relParent(s_curDir); s_browseSel = 0; scanDir(); s_dirty = true; lastMs = now;
+    if (dn && n) { s_browseSel = (s_browseSel+1)%n; s_dirty=true; }
+    if (up && n) { s_browseSel = (s_browseSel-1+n)%n; s_dirty=true; }
+    if (l && s_curDir.length()) {
+      s_curDir = relParent(s_curDir); s_browseSel = 0; scanDir(); s_dirty = true;
     }
-    if (r && !pR && now - lastMs > debounce && n) {
+    bool tapAct = (tapRow >= 0 && tapRow == s_browseSel);   // tap on selected row
+    if (tapRow >= 0 && tapRow != s_browseSel) { s_browseSel = tapRow; s_dirty = true; }
+    bool open = (r && n) || tapAct;
+    if (open) {
       const DirEntry& e = s_entries[s_browseSel];
       if (e.isDir) {
         if (e.name == "..") s_curDir = relParent(s_curDir);
@@ -316,24 +368,21 @@ void loop() {
         indexFile(relJoin(s_curDir, e.name));
         s_btnSel = 0; s_screen = Screen::Buttons; s_dirty = true;
       }
-      lastMs = now;
     }
   } else {
     int n = displayCount();
-    if (dn && !pDn && now - lastMs > debounce && n) { s_btnSel = (s_btnSel+1)%n; s_dirty=true; lastMs=now; }
-    if (up && !pUp && now - lastMs > debounce && n) { s_btnSel = (s_btnSel-1+n)%n; s_dirty=true; lastMs=now; }
-    if (l && !pL && now - lastMs > debounce) {
-      s_screen = Screen::Browse; s_dirty = true; lastMs = now;
-    }
-    if (r && !pR && now - lastMs > debounce && n) {
+    if (dn && n) { s_btnSel = (s_btnSel+1)%n; s_dirty=true; }
+    if (up && n) { s_btnSel = (s_btnSel-1+n)%n; s_dirty=true; }
+    if (l) { s_screen = Screen::Browse; s_dirty = true; }
+    bool tapAct = (tapRow >= 0 && tapRow == s_btnSel && n);  // tap on selected row
+    if (tapRow >= 0 && tapRow != s_btnSel) { s_btnSel = tapRow; s_dirty = true; }
+    bool send = (r && n) || tapAct;
+    if (send) {
       if (isSweepRow(s_btnSel)) sweepName(s_sweepNames[s_btnSel]);
       else sendOneOffset(s_records[recordRow(s_btnSel)].offset);
       drawStatusLine();
-      lastMs = now;
     }
   }
-
-  pUp=up; pDn=dn; pR=r; pL=l;
 }
 
 } // namespace IRFlipper
