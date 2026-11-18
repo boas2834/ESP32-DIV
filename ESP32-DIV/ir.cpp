@@ -53,7 +53,9 @@ static void irSetUniversalRemoteNavLabels() {
 }
 
 static void irSetUniversalBrowseNavLabels() {
-  setTouchNavLabels("Back", "Next", "Exit", "Prev", "Select");
+  // Center (SELECT) now selects the highlighted row; use the toolbar back icon
+  // or back out to the Remote screen to leave the feature.
+  setTouchNavLabels("Back", "Next", "Select", "Prev", "Open");
 }
 
 
@@ -3301,14 +3303,26 @@ void setup() {
 }
 
 void loop() {
-  if (feature_active && (feature_exit_requested || featureExitButtonPressed())) {
-    feature_exit_requested = true;
+  // Exit only on an explicit request. The center/SELECT button is no longer a
+  // blanket "leave feature": in list screens it selects; on the Remote screen
+  // it exits (handled below), and the toolbar back icon exits too.
+  if (feature_active && feature_exit_requested) {
     return;
   }
 
   if (!s_uiDrawn) drawAll();
   maintainTouchNavBar();
   handleUniversalNavButtons();
+
+  // Center/SELECT: select the highlighted entry in a list; exit from Remote.
+  if (isButtonPressedEdge(BTN_SELECT)) {
+    if (s_screen == Screen::Remote) {
+      feature_exit_requested = true;
+      while (featureExitButtonPressed()) { delay(5); }   // drain the hold
+      return;
+    }
+    browseSelect();
+  }
 
   const uint32_t now = millis();
   static uint32_t lastBtnMs = 0;

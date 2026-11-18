@@ -3959,18 +3959,9 @@ void handleOtherSubmenuButtons() {
                     current_submenu_index = 2;
                     in_sub_menu = true;
                     IRUniversalController::loop();
-                    if (featureExitButtonPressed()) {
-                        in_sub_menu = true;
-                        is_main_menu = false;
-                        submenu_initialized = false;
-                        feature_active = false;
-                        feature_exit_requested = false;
-                        displaySubmenu();
-                        delay(200);
-                        while (featureExitButtonPressed()) {
-                        }
-                        break;
-                    }
+                    // Exit is driven by the feature via feature_exit_requested
+                    // (the center/SELECT button is repurposed as Select inside
+                    // the IR lists), so don't force-exit on it here.
                 }
                 if (feature_exit_requested) {
                     in_sub_menu = true;
@@ -3991,18 +3982,9 @@ void handleOtherSubmenuButtons() {
                     current_submenu_index = 3;
                     in_sub_menu = true;
                     IRFlipper::loop();
-                    if (featureExitButtonPressed()) {
-                        in_sub_menu = true;
-                        is_main_menu = false;
-                        submenu_initialized = false;
-                        feature_active = false;
-                        feature_exit_requested = false;
-                        displaySubmenu();
-                        delay(200);
-                        while (featureExitButtonPressed()) {
-                        }
-                        break;
-                    }
+                    // Exit is driven by the feature via feature_exit_requested
+                    // (the center/SELECT button is repurposed as Select inside
+                    // the IR lists), so don't force-exit on it here.
                 }
                 if (feature_exit_requested) {
                     in_sub_menu = true;
@@ -4208,18 +4190,9 @@ void handleOtherSubmenuButtons() {
                     current_submenu_index = 2;
                     in_sub_menu = true;
                     IRUniversalController::loop();
-                    if (featureExitButtonPressed()) {
-                        in_sub_menu = true;
-                        is_main_menu = false;
-                        submenu_initialized = false;
-                        feature_active = false;
-                        feature_exit_requested = false;
-                        displaySubmenu();
-                        delay(200);
-                        while (featureExitButtonPressed()) {
-                        }
-                        break;
-                    }
+                    // Exit is driven by the feature via feature_exit_requested
+                    // (the center/SELECT button is repurposed as Select inside
+                    // the IR lists), so don't force-exit on it here.
                 }
                 if (feature_exit_requested) {
                     in_sub_menu = true;
@@ -4240,18 +4213,9 @@ void handleOtherSubmenuButtons() {
                     current_submenu_index = 3;
                     in_sub_menu = true;
                     IRFlipper::loop();
-                    if (featureExitButtonPressed()) {
-                        in_sub_menu = true;
-                        is_main_menu = false;
-                        submenu_initialized = false;
-                        feature_active = false;
-                        feature_exit_requested = false;
-                        displaySubmenu();
-                        delay(200);
-                        while (featureExitButtonPressed()) {
-                        }
-                        break;
-                    }
+                    // Exit is driven by the feature via feature_exit_requested
+                    // (the center/SELECT button is repurposed as Select inside
+                    // the IR lists), so don't force-exit on it here.
                 }
                 if (feature_exit_requested) {
                     in_sub_menu = true;

@@ -267,12 +267,13 @@ void redrawBrowse() {
     });
   }
   if (featureHasTouchNavBar()) {
-    // slots: left, down, center, up, right
-    setTouchNavLabels(s_curDir.length() ? "Ordner+" : nullptr,
-                      "Runter", "Exit", "Hoch", "Oeffnen");
+    // slots: left, down, center, up, right. Center (SELECT) = Open now; LEFT is
+    // "one level up", or "Exit" at the top folder.
+    setTouchNavLabels(s_curDir.length() ? "Hoch" : "Exit",
+                      "Runter", "Oeffnen", "Hoch", "Oeffnen");
     redrawTouchButtonBar();
   }
-  s_status = "Oeffnen=Ordner/Datei  Ordner+=hoch";
+  s_status = "Oeffnen=Ordner/Datei  Hoch=zurueck";
   drawStatusLine();
 }
 
@@ -287,7 +288,8 @@ void redrawButtons() {
   drawHeader(String("File: ") + fn);
   drawList(displayCount(), s_btnSel, displayLabel);
   if (featureHasTouchNavBar()) {
-    setTouchNavLabels("Zurueck", "Runter", "Exit", "Hoch", "Senden");
+    // Center (SELECT) = Send now; LEFT goes back to the folder list.
+    setTouchNavLabels("Zurueck", "Runter", "Senden", "Hoch", "Senden");
     redrawTouchButtonBar();
   }
   s_status = "Senden  Zurueck=Liste";
@@ -380,8 +382,10 @@ void setup() {
 }
 
 void loop() {
-  if (feature_active && (feature_exit_requested || featureExitButtonPressed())) {
-    feature_exit_requested = true;
+  // The center/SELECT button is repurposed as Open/Send here (see below), so
+  // exit only on an explicit request: Back at the top folder, or the center
+  // slot label "Exit" is no longer used. Leaving happens via BTN_LEFT at root.
+  if (feature_active && feature_exit_requested) {
     return;
   }
   redrawTouchButtonBar();
@@ -395,12 +399,15 @@ void loop() {
 
   // Edge-triggered input: isButtonPressedEdge() fires once per press for BOTH
   // the on-screen touch nav bar and the physical PCF buttons, so every action
-  // works by touch or by button. (Exit is handled above via the center/exit
-  // slot and featureExitButtonPressed().)
-  bool up = isButtonPressedEdge(BTN_UP);
-  bool dn = isButtonPressedEdge(BTN_DOWN);
-  bool r  = isButtonPressedEdge(BTN_RIGHT);
-  bool l  = isButtonPressedEdge(BTN_LEFT);
+  // works by touch or by button. The center/SELECT button now Opens/Sends (it
+  // is no longer a blanket feature-exit); LEFT goes up a level and exits at the
+  // top folder.
+  bool up  = isButtonPressedEdge(BTN_UP);
+  bool dn  = isButtonPressedEdge(BTN_DOWN);
+  bool rRight = isButtonPressedEdge(BTN_RIGHT);
+  bool rSel   = isButtonPressedEdge(BTN_SELECT);  // evaluate both to consume edges
+  bool r   = rRight || rSel;
+  bool l   = isButtonPressedEdge(BTN_LEFT);
 
   // Direct tap on a list row: select it, and tapping the already-selected row
   // acts on it (open folder/file in Browse, send in Buttons).
@@ -421,8 +428,9 @@ void loop() {
     int n = (int)s_entries.size();
     if (dn && n) { s_browseSel = (s_browseSel+1)%n; s_dirty=true; }
     if (up && n) { s_browseSel = (s_browseSel-1+n)%n; s_dirty=true; }
-    if (l && s_curDir.length()) {
-      s_curDir = relParent(s_curDir); s_browseSel = 0; scanDir(); s_dirty = true;
+    if (l) {
+      if (s_curDir.length()) { s_curDir = relParent(s_curDir); s_browseSel = 0; scanDir(); s_dirty = true; }
+      else { feature_exit_requested = true; return; }   // Back at the top folder leaves
     }
     bool tapAct = (tapRow >= 0 && tapRow == s_browseSel);   // tap on selected row
     if (tapRow >= 0 && tapRow != s_browseSel) { s_browseSel = tapRow; s_dirty = true; }
