@@ -148,6 +148,10 @@ namespace jammingdetector {
   void Setup();
   void Loop();
 }
+namespace SubFlipper {
+  void setup();
+  void loop();
+}
 
 /* ───────────── WiFi namespaces ───────────── */
 namespace PacketMonitor {
