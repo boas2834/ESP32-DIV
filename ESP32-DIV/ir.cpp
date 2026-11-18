@@ -12,6 +12,7 @@
 #include "icon.h"
 #include "shared.h"
 #include "utils.h"
+#include "ir_flipper.h"   // Flipper .ir library source for the Universal Controller
 
 static constexpr int kIrScreenH = 320;
 
@@ -52,7 +53,9 @@ static void irSetUniversalRemoteNavLabels() {
 }
 
 static void irSetUniversalBrowseNavLabels() {
-  setTouchNavLabels("Back", "Next", "Exit", "Prev", "Select");
+  // Center (SELECT) now selects the highlighted row; use the toolbar back icon
+  // or back out to the Remote screen to leave the feature.
+  setTouchNavLabels("Back", "Next", "Select", "Prev", "Open");
 }
 
 
@@ -2078,15 +2081,90 @@ static bool s_loadedFromSd = false;
 static FeatureUI::Button s_keyBtns[KeyCount];
 
 // Browser state.
-enum class Screen : uint8_t { Remote, Category, Brand, Profile };
+// Screens: the original three browse levels (Category/Brand/Profile) + Remote,
+// plus FlipBrowse for the Flipper .ir library (a lazy folder browser that also
+// doubles as the "more buttons" list for an opened device).
+enum class Screen : uint8_t { Remote, Category, Brand, Profile, FlipBrowse };
 static Screen s_screen = Screen::Remote;
 static std::vector<String> s_categories;
 static std::vector<String> s_brands;
-static std::vector<int> s_filteredProfileIdx;   
+static std::vector<int> s_filteredProfileIdx;
 static String s_selectedCategory = "";
 static String s_selectedBrand = "";
 static int s_listSel = 0;
 static uint32_t s_browseVersion = 0;
+
+// ---- Flipper .ir library source -----------------------------------------
+// Synthetic category "Flipper SD" opens a lazy folder browser over /ir_flipper.
+// Opening a .ir file builds a transient Profile (s_flipProfile) whose 12 keys
+// point at SD byte offsets; the normal Remote screen then renders it and keys
+// transmit via IRFlipper::libSend(). Nothing from the (huge) tree is cached.
+static const char* kFlipperCategory = "Flipper SD";
+static bool   s_flipActive = false;             // Remote is showing a Flipper device
+static bool   s_flipExtras = false;             // FlipBrowse is the "more buttons" list
+static String s_flipDir    = "";                // current folder, rel to /ir_flipper
+static String s_flipFile   = "";                // opened file, rel to /ir_flipper
+static std::vector<IRFlipper::Child> s_flipKids;   // current folder entries
+static std::vector<IRFlipper::Btn>   s_flipBtns;   // buttons of the opened file
+static std::vector<String>           s_flipNames;  // display labels for FlipBrowse
+static Profile  s_flipProfile;                  // transient profile for the Remote
+static uint32_t s_flipOff[KeyCount];            // per-key SD offset into s_flipFile
+static String   s_flipQuery  = "";              // manufacturer/name filter for FlipBrowse
+static const char* kFlipSearchTag = "\x01s";    // sentinel name for the search row
+
+// Normalise a button/key name: lower-case, drop everything but a-z0-9.
+static String normKey(const String& in) {
+  String o; o.reserve(in.length());
+  for (size_t i = 0; i < in.length(); ++i) {
+    char c = in[i];
+    if (c >= 'A' && c <= 'Z') c = c - 'A' + 'a';
+    if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) o += c;
+  }
+  return o;
+}
+
+// Map a Flipper button name onto one of the 12 universal keys, or -1.
+static int flipKeyId(const String& name) {
+  String n = normKey(name);
+  if (n == "power" || n == "pwr" || n == "standby" || n == "onoff") return Power;
+  if (n == "mute")  return Mute;
+  if (n == "volup" || n == "vol" || n == "volumeup" || n == "volplus" || n == "volumeplus") return VolUp;
+  if (n == "voldn" || n == "voldown" || n == "volumedown" || n == "volminus") return VolDn;
+  if (n == "chup" || n == "chnext" || n == "channelup" || n == "programup" || n == "progup") return ChUp;
+  if (n == "chdn" || n == "chdown" || n == "chprev" || n == "channeldown" || n == "programdown" || n == "progdown") return ChDn;
+  if (n == "up")    return Up;
+  if (n == "down")  return Down;
+  if (n == "left")  return Left;
+  if (n == "right") return Right;
+  if (n == "ok" || n == "select" || n == "enter") return Ok;
+  if (n == "back" || n == "return" || n == "exit") return Back;
+  return -1;
+}
+
+// The profile the Remote screen is currently showing.
+static const Profile& curProfile() {
+  return s_flipActive ? s_flipProfile : s_profiles[s_profileIdx];
+}
+
+static String flipParent(const String& p) {
+  int s = p.lastIndexOf('/');
+  return s < 0 ? String("") : p.substring(0, s);
+}
+static String flipJoin(const String& base, const String& leaf) {
+  return base.length() ? base + "/" + leaf : leaf;
+}
+static String baseName(const String& p) {
+  int s = p.lastIndexOf('/');
+  return s < 0 ? p : p.substring(s + 1);
+}
+
+// Forward declarations (defined lower, near the browse logic).
+static void loadFlipDir();
+static void enterFlipper();
+static void openFlipExtras();
+static void flipOpenSelected();
+static void flipBack();
+static void buildFlipProfile(const String& relFile);
 
 static const unsigned char* keyIcon(KeyId k) {
   switch (k) {
@@ -2567,7 +2645,25 @@ static void drawInfoPanel() {
   tft.setTextFont(1);
   tft.setTextSize(1);
   tft.setTextColor(UI_DIM_TEXT, FEATURE_BG);
-  tft.drawString("Profile", kInfoBoxX + 4, kInfoBoxY + 3);
+  tft.drawString(s_flipActive ? "Flipper" : "Profile", kInfoBoxX + 4, kInfoBoxY + 3);
+
+  // Flipper device: proto/bits are per-button (and may be raw), so show the
+  // file name and source instead of the JSON-profile fields.
+  if (s_flipActive) {
+    tft.setTextColor(UI_DIM_TEXT, FEATURE_BG);
+    tft.setCursor(kPadX, kInfoTextY);
+    tft.print("Name:");
+    tft.setTextColor(UI_TEXT, FEATURE_BG);
+    tft.setCursor(kDetailValueX, kInfoTextY);
+    tft.print(truncateWithEllipsis(s_flipProfile.name, kDetailCol2LabelX - kDetailValueX - 4));
+    tft.setTextColor(UI_DIM_TEXT, FEATURE_BG);
+    tft.setCursor(kPadX, kInfoTextY + kDetailLineStep);
+    tft.print("Src:");
+    tft.setTextColor(UI_TEXT, FEATURE_BG);
+    tft.setCursor(kDetailValueX, kInfoTextY + kDetailLineStep);
+    tft.print("Flipper .ir (SD)");
+    return;
+  }
 
   if (s_profiles.empty()) {
     tft.setTextColor(UI_WARN, FEATURE_BG);
@@ -2636,6 +2732,15 @@ static void drawBrowseHeader() {
     String br = s_selectedBrand.length() ? s_selectedBrand : "ALL";
     if (br.length() > 18) br = br.substring(0, 18);
     tft.print(br);
+  } else if (s_screen == Screen::FlipBrowse) {
+    tft.print(s_flipExtras ? "Weitere Tasten" : "Flipper:");
+    if (!s_flipExtras) {
+      tft.setTextColor(UI_TEXT, FEATURE_BG);
+      tft.setCursor(kDetailValueX, kBrowseHeaderY);
+      String d = s_flipDir.length() ? s_flipDir : String("/");
+      if (d.length() > 18) d = d.substring(d.length() - 18);
+      tft.print(d);
+    }
   }
   tft.drawFastHLine(kPadX, kListY - 1, kListW, UI_LINE);
 }
@@ -2669,7 +2774,6 @@ static bool handleToolbarTouch(int x, int y) {
 static void rebuildCategoriesAndBrands() {
   s_categories.clear();
   s_brands.clear();
-  if (s_profiles.empty()) return;
 
   auto addUnique = [](std::vector<String>& v, const String& s) {
     for (auto& x : v) if (x == s) return;
@@ -2680,6 +2784,10 @@ static void rebuildCategoriesAndBrands() {
     addUnique(s_categories, p.category.length() ? p.category : String("OTHER"));
   }
   std::sort(s_categories.begin(), s_categories.end());
+  // Surface the SD Flipper library as its own category (even with no JSON
+  // profiles present), always first so it's easy to find.
+  if (IRFlipper::libAvailable())
+    s_categories.insert(s_categories.begin(), String(kFlipperCategory));
   s_browseVersion++;
 }
 
@@ -2787,6 +2895,7 @@ static int browseItemCount() {
   if (s_screen == Screen::Category) return (int)s_categories.size();
   if (s_screen == Screen::Brand) return (int)s_brands.size();
   if (s_screen == Screen::Profile) return (int)s_filteredProfileIdx.size();
+  if (s_screen == Screen::FlipBrowse) return (int)s_flipNames.size();
   return 0;
 }
 
@@ -2804,6 +2913,7 @@ static void redrawBrowseListOnly() {
   if (s_screen == Screen::Category) drawListScreen(s_categories);
   else if (s_screen == Screen::Brand) drawListScreen(s_brands);
   else if (s_screen == Screen::Profile) drawListScreen(profileBrowseNames());
+  else if (s_screen == Screen::FlipBrowse) drawListScreen(s_flipNames);
 }
 
 static void bumpBrowseSelection(int delta) {
@@ -2861,7 +2971,7 @@ static void drawKeys() {
   layoutKeyButtons();
   tft.fillRect(0, kRemoteKeysTop, 240, universalContentBottom() - kRemoteKeysTop, FEATURE_BG);
 
-  if (s_profiles.empty()) {
+  if (!s_flipActive && s_profiles.empty()) {
     tft.setTextFont(1);
     tft.setTextColor(UI_TEXT, FEATURE_BG);
     tft.setCursor(kPadX, kRemoteKeysTop + 12);
@@ -2873,7 +2983,7 @@ static void drawKeys() {
     return;
   }
 
-  const Profile& p = s_profiles[s_profileIdx];
+  const Profile& p = curProfile();
   for (int i = 0; i < (int)KeyCount; i++) {
     s_keyBtns[i].disabled = !p.has[i];
   }
@@ -2884,7 +2994,12 @@ static void drawKeys() {
 
 static void drawFooter() {
   if (s_screen == Screen::Remote) {
-    irSetUniversalRemoteNavLabels();
+    if (s_flipActive) {
+      // LEFT -> back to folder browser, DOWN -> more buttons.
+      setTouchNavLabels("Ordner", "Tasten", "Exit", nullptr, nullptr);
+    } else {
+      irSetUniversalRemoteNavLabels();
+    }
   } else {
     irSetUniversalBrowseNavLabels();
   }
@@ -2912,6 +3027,17 @@ static void drawAll() {
 }
 
 static void sendKey(KeyId k) {
+  // Flipper device: transmit the mapped button straight from SD (raw or parsed).
+  if (s_flipActive) {
+    if (!s_flipProfile.has[k]) {
+      showNotification("IR", "Taste in dieser Datei nicht belegt");
+      return;
+    }
+    if (!IRFlipper::libSend(s_flipFile, s_flipOff[k]))
+      showNotification("IR", "Senden fehlgeschlagen");
+    return;
+  }
+
   if (s_profiles.empty()) return;
   const Profile& p = s_profiles[s_profileIdx];
   if (!p.has[k]) {
@@ -2929,6 +3055,7 @@ static void sendKey(KeyId k) {
 }
 
 static void changeProfile(int delta) {
+  if (s_flipActive) return;   // Flipper device has no profile list to page
   if (s_profiles.empty()) return;
   int n = (int)s_profiles.size();
   s_profileIdx = (s_profileIdx + delta) % n;
@@ -2951,14 +3078,148 @@ static void reloadUniversalProfiles() {
 }
 
 static void browseBack() {
+  if (s_screen == Screen::FlipBrowse) { flipBack(); return; }
   if (s_screen == Screen::Category) s_screen = Screen::Remote;
   else if (s_screen == Screen::Brand) s_screen = Screen::Category;
   else if (s_screen == Screen::Profile) s_screen = Screen::Brand;
   s_uiDrawn = false;
 }
 
+static bool nameContainsCI(const String& hay, const String& needle) {
+  if (!needle.length()) return true;
+  String h = hay; h.toLowerCase();
+  String n = needle; n.toLowerCase();
+  return h.indexOf(n) >= 0;
+}
+
+// Load the current /ir_flipper/<s_flipDir> folder into s_flipKids/s_flipNames.
+// Row 0 is always the search row; ".." follows (outside root); then the folder
+// entries, filtered by s_flipQuery (case-insensitive substring) when set.
+static void loadFlipDir() {
+  s_flipExtras = false;
+  s_flipKids.clear();
+  s_flipNames.clear();
+
+  s_flipKids.push_back({String(kFlipSearchTag), true});
+  s_flipNames.push_back(s_flipQuery.length()
+                          ? (String("[Suche: ") + s_flipQuery + "]  (X)")
+                          : String("[Suchen]"));
+
+  if (s_flipDir.length()) { s_flipKids.push_back({String(".."), true}); s_flipNames.push_back(".."); }
+
+  std::vector<IRFlipper::Child> kids;
+  IRFlipper::libList(s_flipDir, kids);
+  for (auto& c : kids) {
+    if (!nameContainsCI(c.name, s_flipQuery)) continue;
+    s_flipKids.push_back(c);
+    s_flipNames.push_back(c.isDir ? (String("[") + c.name + "]") : c.name);
+  }
+  s_browseVersion++;   // force a full list redraw
+}
+
+// Open the on-screen keyboard to set/replace the manufacturer filter.
+static void openFlipSearch() {
+  OnScreenKeyboardConfig cfg{};
+  cfg.titleLine1 = "Suchen";
+  cfg.titleLine2 = "^ caps, # sym";
+  osKeyboardUseStandardLayout(cfg);
+  cfg.maxLen = 24;
+  cfg.shuffleNames = nullptr;
+  cfg.shuffleCount = 0;
+  cfg.buttonsY = 195;
+  cfg.backLabel = "Back";
+  cfg.middleLabel = "Del";
+  cfg.okLabel = "OK";
+  cfg.enableShuffle = false;
+  cfg.requireNonEmpty = false;
+  cfg.emptyErrorMsg = "";
+  OnScreenKeyboardResult r = showOnScreenKeyboard(cfg, s_flipQuery);
+  if (r.accepted) { s_flipQuery = r.text; s_flipQuery.trim(); }
+  resetTouchNavHeldState();   // clear nav edge state after the full-screen overlay
+  s_listSel = 0;
+  loadFlipDir();
+  s_uiDrawn = false;          // force a full redraw of the browser
+}
+
+// Enter the Flipper library from the Category screen.
+static void enterFlipper() {
+  s_flipActive = false;
+  s_flipExtras = false;
+  s_flipDir = "";
+  s_flipQuery = "";
+  loadFlipDir();
+  s_screen = Screen::FlipBrowse;
+  s_listSel = 0;
+  s_uiDrawn = false;
+}
+
+// Open a .ir file: lazily index its buttons and build the transient profile.
+static void buildFlipProfile(const String& relFile) {
+  IRFlipper::libIndex(relFile, s_flipBtns);
+  s_flipProfile = Profile{};
+  s_flipProfile.name = baseName(relFile);
+  s_flipProfile.category = kFlipperCategory;
+  s_flipProfile.brand = baseName(s_flipDir);
+  for (int k = 0; k < (int)KeyCount; ++k) { s_flipProfile.has[k] = false; s_flipOff[k] = 0; }
+  for (auto& b : s_flipBtns) {               // first occurrence of a name wins
+    int k = flipKeyId(b.name);
+    if (k >= 0 && !s_flipProfile.has[k]) { s_flipProfile.has[k] = true; s_flipOff[k] = b.offset; }
+  }
+  s_flipFile = relFile;
+  s_flipActive = true;
+  s_flipExtras = false;
+  s_screen = Screen::Remote;
+  s_uiDrawn = false;
+}
+
+// Show every button of the opened file as a tappable "more buttons" list.
+static void openFlipExtras() {
+  s_flipExtras = true;
+  s_flipNames.clear();
+  for (auto& b : s_flipBtns) s_flipNames.push_back(b.name);
+  s_browseVersion++;   // force a full list redraw
+  s_screen = Screen::FlipBrowse;
+  s_listSel = 0;
+  s_uiDrawn = false;
+}
+
+// RIGHT/Select inside FlipBrowse: descend a folder, open a file, or (in the
+// extras list) transmit the selected button.
+static void flipOpenSelected() {
+  if (s_flipNames.empty()) return;
+  int sel = std::max(0, std::min(s_listSel, (int)s_flipNames.size() - 1));
+  if (s_flipExtras) {
+    if (sel < (int)s_flipBtns.size())
+      IRFlipper::libSend(s_flipFile, s_flipBtns[sel].offset);
+    return;
+  }
+  if (sel >= (int)s_flipKids.size()) return;
+  const IRFlipper::Child c = s_flipKids[sel];
+  if (c.name == kFlipSearchTag) { openFlipSearch(); return; }
+  // Changing folders clears the per-folder filter.
+  if (c.name == "..") { s_flipDir = flipParent(s_flipDir); s_flipQuery = ""; loadFlipDir(); s_listSel = 0; s_uiDrawn = false; }
+  else if (c.isDir)   { s_flipDir = flipJoin(s_flipDir, c.name); s_flipQuery = ""; loadFlipDir(); s_listSel = 0; s_uiDrawn = false; }
+  else                { buildFlipProfile(flipJoin(s_flipDir, c.name)); }
+}
+
+// LEFT/Back inside FlipBrowse.
+static void flipBack() {
+  if (s_flipExtras) { s_flipExtras = false; s_screen = Screen::Remote; s_uiDrawn = false; return; }
+  if (s_flipQuery.length()) { s_flipQuery = ""; loadFlipDir(); s_listSel = 0; s_uiDrawn = false; return; }  // clear filter first
+  if (s_flipDir.length()) { s_flipDir = flipParent(s_flipDir); loadFlipDir(); s_listSel = 0; s_uiDrawn = false; return; }
+  s_flipActive = false;
+  s_screen = Screen::Category;
+  s_listSel = 0;
+  s_uiDrawn = false;
+}
+
 static void browseSelect() {
+  if (s_screen == Screen::FlipBrowse) { flipOpenSelected(); return; }
   if (s_screen == Screen::Category) {
+    if (!s_categories.empty()) {
+      int si = std::max(0, std::min(s_listSel, (int)s_categories.size() - 1));
+      if (s_categories[si] == kFlipperCategory) { enterFlipper(); return; }
+    }
     if (s_categories.empty()) return;
     s_selectedCategory = s_categories[std::max(0, std::min(s_listSel, (int)s_categories.size() - 1))];
     rebuildBrandsForCategory(s_selectedCategory);
@@ -2989,6 +3250,17 @@ static void handleUniversalNavButtons() {
   }
 
   if (s_screen == Screen::Remote) {
+    if (s_flipActive) {
+      // Flipper device: no profile list to page through. LEFT -> back to the
+      // folder browser, DOWN -> "more buttons" list.
+      if (isTouchNavButtonPressedEdge(BTN_LEFT)) {
+        s_flipActive = false; s_screen = Screen::FlipBrowse; loadFlipDir(); s_uiDrawn = false;
+      }
+      if (isTouchNavButtonPressedEdge(BTN_DOWN)) {
+        openFlipExtras();
+      }
+      return;
+    }
     if (isTouchNavButtonPressedEdge(BTN_LEFT)) {
       changeProfile(-1);
     }
@@ -3004,14 +3276,10 @@ static void handleUniversalNavButtons() {
     return;
   }
 
+  // UP/DOWN in browse screens are handled by the auto-repeat listStep() in
+  // loop(); here we only take LEFT (back) and RIGHT (select).
   if (isTouchNavButtonPressedEdge(BTN_LEFT)) {
     browseBack();
-  }
-  if (isTouchNavButtonPressedEdge(BTN_DOWN)) {
-    bumpBrowseSelection(1);
-  }
-  if (isTouchNavButtonPressedEdge(BTN_UP)) {
-    bumpBrowseSelection(-1);
   }
   if (isTouchNavButtonPressedEdge(BTN_RIGHT)) {
     browseSelect();
@@ -3030,15 +3298,52 @@ void setup() {
   drawAll();
 }
 
+// Held UP/DOWN auto-repeat for list scrolling: returns -1/+1 on the initial
+// press and then, while the button stays held, repeatedly (after a short delay,
+// speeding up on a long hold). 0 when nothing should step this pass.
+static int listStep() {
+  static int dir = 0;
+  static uint32_t downAt = 0, lastRep = 0;
+  const bool up = isButtonPressed(BTN_UP)   || isTouchNavButtonPressed(BTN_UP);
+  const bool dn = isButtonPressed(BTN_DOWN) || isTouchNavButtonPressed(BTN_DOWN);
+  const int d = up ? -1 : (dn ? 1 : 0);
+  const uint32_t now = millis();
+  if (d == 0) { dir = 0; return 0; }
+  if (d != dir) { dir = d; downAt = now; lastRep = now; return d; }  // first step
+  if (now - downAt < 400) return 0;                 // delay before auto-repeat
+  const uint32_t interval = (now - downAt > 2000) ? 45 : 110;  // speed up on long hold
+  if (now - lastRep >= interval) { lastRep = now; return d; }
+  return 0;
+}
+
 void loop() {
-  if (feature_active && (feature_exit_requested || featureExitButtonPressed())) {
-    feature_exit_requested = true;
+  // Exit only on an explicit request. The center/SELECT button is no longer a
+  // blanket "leave feature": in list screens it selects; on the Remote screen
+  // it exits (handled below), and the toolbar back icon exits too.
+  if (feature_active && feature_exit_requested) {
     return;
   }
 
   if (!s_uiDrawn) drawAll();
   maintainTouchNavBar();
   handleUniversalNavButtons();
+
+  // Center/SELECT: select the highlighted entry in a list; exit from Remote.
+  if (isButtonPressedEdge(BTN_SELECT)) {
+    if (s_screen == Screen::Remote) {
+      feature_exit_requested = true;
+      while (featureExitButtonPressed()) { delay(5); }   // drain the hold
+      return;
+    }
+    browseSelect();
+  }
+
+  // Held UP/DOWN scrolls the list automatically (browse screens only; on the
+  // Remote screen UP/DOWN are reload/volume, handled below).
+  if (s_screen != Screen::Remote) {
+    int st = listStep();
+    if (st) bumpBrowseSelection(st);
+  }
 
   const uint32_t now = millis();
   static uint32_t lastBtnMs = 0;
@@ -3055,44 +3360,10 @@ void loop() {
       else if (upNow && !prevUp) { sendKey(VolUp); lastBtnMs = now; }
       else if (downNow && !prevDown) { sendKey(VolDn); lastBtnMs = now; }
     } else {
-      if (upNow && !prevUp) { bumpBrowseSelection(-1); lastBtnMs = now; }
-      else if (downNow && !prevDown) { bumpBrowseSelection(1); lastBtnMs = now; }
-      else if (leftNow && !prevLeft) {
-        if (s_screen == Screen::Category) { s_screen = Screen::Remote; }
-        else if (s_screen == Screen::Brand) { s_screen = Screen::Category; }
-        else if (s_screen == Screen::Profile) { s_screen = Screen::Brand; }
-        s_uiDrawn = false; lastBtnMs = now;
-      } else if (rightNow && !prevRight) {
-        if (s_screen == Screen::Category) {
-          if (!s_categories.empty()) {
-            s_selectedCategory = s_categories[std::max(0, std::min(s_listSel, (int)s_categories.size()-1))];
-            rebuildBrandsForCategory(s_selectedCategory);
-            s_screen = Screen::Brand;
-            s_listSel = 0;
-            s_uiDrawn = false;
-            lastBtnMs = now;
-          }
-        } else if (s_screen == Screen::Brand) {
-          if (!s_brands.empty()) {
-            s_selectedBrand = s_brands[std::max(0, std::min(s_listSel, (int)s_brands.size()-1))];
-            rebuildFilteredProfiles();
-            s_screen = Screen::Profile;
-            s_listSel = 0;
-            s_uiDrawn = false;
-            lastBtnMs = now;
-          }
-        } else if (s_screen == Screen::Profile) {
-          if (!s_filteredProfileIdx.empty()) {
-            int idx = s_filteredProfileIdx[std::max(0, std::min(s_listSel, (int)s_filteredProfileIdx.size()-1))];
-            if (idx >= 0 && idx < (int)s_profiles.size()) {
-              s_profileIdx = idx;
-              s_screen = Screen::Remote;
-              s_uiDrawn = false;
-              lastBtnMs = now;
-            }
-          }
-        }
-      }
+      // Browse screens: UP/DOWN handled by listStep() (auto-repeat) above; here
+      // only LEFT (back) and RIGHT (select). Same handlers as the touch nav bar.
+      if (leftNow && !prevLeft) { browseBack(); lastBtnMs = now; }
+      else if (rightNow && !prevRight) { browseSelect(); lastBtnMs = now; }
     }
   }
   prevLeft = leftNow;
@@ -3135,6 +3406,7 @@ void loop() {
         if (s_screen == Screen::Category) max = (int)s_categories.size();
         else if (s_screen == Screen::Brand) max = (int)s_brands.size();
         else if (s_screen == Screen::Profile) max = (int)s_filteredProfileIdx.size();
+        else if (s_screen == Screen::FlipBrowse) max = (int)s_flipNames.size();
         if (idx >= 0 && idx < max) {
           s_listSel = idx;
           redrawBrowseListOnly();
