@@ -2107,6 +2107,8 @@ static std::vector<IRFlipper::Btn>   s_flipBtns;   // buttons of the opened file
 static std::vector<String>           s_flipNames;  // display labels for FlipBrowse
 static Profile  s_flipProfile;                  // transient profile for the Remote
 static uint32_t s_flipOff[KeyCount];            // per-key SD offset into s_flipFile
+static String   s_flipQuery  = "";              // manufacturer/name filter for FlipBrowse
+static const char* kFlipSearchTag = "\x01s";    // sentinel name for the search row
 
 // Normalise a button/key name: lower-case, drop everything but a-z0-9.
 static String normKey(const String& in) {
@@ -3081,18 +3083,60 @@ static void browseBack() {
   s_uiDrawn = false;
 }
 
+static bool nameContainsCI(const String& hay, const String& needle) {
+  if (!needle.length()) return true;
+  String h = hay; h.toLowerCase();
+  String n = needle; n.toLowerCase();
+  return h.indexOf(n) >= 0;
+}
+
 // Load the current /ir_flipper/<s_flipDir> folder into s_flipKids/s_flipNames.
+// Row 0 is always the search row; ".." follows (outside root); then the folder
+// entries, filtered by s_flipQuery (case-insensitive substring) when set.
 static void loadFlipDir() {
   s_flipExtras = false;
   s_flipKids.clear();
   s_flipNames.clear();
+
+  s_flipKids.push_back({String(kFlipSearchTag), true});
+  s_flipNames.push_back(s_flipQuery.length()
+                          ? (String("[Suche: ") + s_flipQuery + "]  (X)")
+                          : String("[Hersteller suchen]"));
+
+  if (s_flipDir.length()) { s_flipKids.push_back({String(".."), true}); s_flipNames.push_back(".."); }
+
   std::vector<IRFlipper::Child> kids;
   IRFlipper::libList(s_flipDir, kids);
-  if (s_flipDir.length()) s_flipKids.push_back({String(".."), true});
-  for (auto& c : kids) s_flipKids.push_back(c);
-  for (auto& c : s_flipKids)
+  for (auto& c : kids) {
+    if (!nameContainsCI(c.name, s_flipQuery)) continue;
+    s_flipKids.push_back(c);
     s_flipNames.push_back(c.isDir ? (String("[") + c.name + "]") : c.name);
+  }
   s_browseVersion++;   // force a full list redraw
+}
+
+// Open the on-screen keyboard to set/replace the manufacturer filter.
+static void openFlipSearch() {
+  OnScreenKeyboardConfig cfg{};
+  cfg.titleLine1 = "Hersteller suchen";
+  cfg.titleLine2 = "^ caps, # sym";
+  osKeyboardUseStandardLayout(cfg);
+  cfg.maxLen = 24;
+  cfg.shuffleNames = nullptr;
+  cfg.shuffleCount = 0;
+  cfg.buttonsY = 195;
+  cfg.backLabel = "Back";
+  cfg.middleLabel = "Del";
+  cfg.okLabel = "OK";
+  cfg.enableShuffle = false;
+  cfg.requireNonEmpty = false;
+  cfg.emptyErrorMsg = "";
+  OnScreenKeyboardResult r = showOnScreenKeyboard(cfg, s_flipQuery);
+  if (r.accepted) { s_flipQuery = r.text; s_flipQuery.trim(); }
+  resetTouchNavHeldState();   // clear nav edge state after the full-screen overlay
+  s_listSel = 0;
+  loadFlipDir();
+  s_uiDrawn = false;          // force a full redraw of the browser
 }
 
 // Enter the Flipper library from the Category screen.
@@ -3100,6 +3144,7 @@ static void enterFlipper() {
   s_flipActive = false;
   s_flipExtras = false;
   s_flipDir = "";
+  s_flipQuery = "";
   loadFlipDir();
   s_screen = Screen::FlipBrowse;
   s_listSel = 0;
@@ -3148,14 +3193,17 @@ static void flipOpenSelected() {
   }
   if (sel >= (int)s_flipKids.size()) return;
   const IRFlipper::Child c = s_flipKids[sel];
-  if (c.name == "..") { s_flipDir = flipParent(s_flipDir); loadFlipDir(); s_listSel = 0; s_uiDrawn = false; }
-  else if (c.isDir)   { s_flipDir = flipJoin(s_flipDir, c.name); loadFlipDir(); s_listSel = 0; s_uiDrawn = false; }
+  if (c.name == kFlipSearchTag) { openFlipSearch(); return; }
+  // Changing folders clears the per-folder filter.
+  if (c.name == "..") { s_flipDir = flipParent(s_flipDir); s_flipQuery = ""; loadFlipDir(); s_listSel = 0; s_uiDrawn = false; }
+  else if (c.isDir)   { s_flipDir = flipJoin(s_flipDir, c.name); s_flipQuery = ""; loadFlipDir(); s_listSel = 0; s_uiDrawn = false; }
   else                { buildFlipProfile(flipJoin(s_flipDir, c.name)); }
 }
 
 // LEFT/Back inside FlipBrowse.
 static void flipBack() {
   if (s_flipExtras) { s_flipExtras = false; s_screen = Screen::Remote; s_uiDrawn = false; return; }
+  if (s_flipQuery.length()) { s_flipQuery = ""; loadFlipDir(); s_listSel = 0; s_uiDrawn = false; return; }  // clear filter first
   if (s_flipDir.length()) { s_flipDir = flipParent(s_flipDir); loadFlipDir(); s_listSel = 0; s_uiDrawn = false; return; }
   s_flipActive = false;
   s_screen = Screen::Category;
