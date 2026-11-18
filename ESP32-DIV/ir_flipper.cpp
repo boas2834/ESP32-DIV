@@ -296,6 +296,75 @@ void redrawButtons() {
 
 } // anonymous namespace
 
+// ---- Reusable library API (see ir_flipper.h) -----------------------------
+// These are stateless with respect to the interactive browser above: they take
+// explicit paths and never touch s_curDir/s_records, so the Universal
+// Controller can call them without disturbing (or being disturbed by) a browse
+// session. They reuse the anonymous-namespace helpers (FLIPPER_DIR, endsWithIr,
+// sendRecord, …) from the same translation unit.
+
+bool libAvailable() {
+  return SD.exists(FLIPPER_DIR);
+}
+
+bool libList(const String& relDir, std::vector<Child>& out) {
+  out.clear();
+  String full = relDir.length() ? String(FLIPPER_DIR) + "/" + relDir : String(FLIPPER_DIR);
+  File dir = SD.open(full);
+  if (!dir || !dir.isDirectory()) { if (dir) dir.close(); return false; }
+  std::vector<Child> files;
+  File f;
+  while ((f = dir.openNextFile()) && (out.size() + files.size()) < kMaxEntries) {
+    String n = f.name();
+    int slash = n.lastIndexOf('/');
+    if (slash >= 0) n = n.substring(slash + 1);
+    bool isDir = f.isDirectory();
+    f.close();
+    if (n.length() == 0) continue;
+    if (isDir) out.push_back({n, true});
+    else if (endsWithIr(n)) files.push_back({n, false});
+  }
+  dir.close();
+  for (auto& e : files) out.push_back(e);
+  return true;
+}
+
+bool libIndex(const String& relFile, std::vector<Btn>& out) {
+  out.clear();
+  String path = String(FLIPPER_DIR) + "/" + relFile;
+  File f = SD.open(path, FILE_READ);
+  if (!f) return false;
+  uint32_t pos = f.position();
+  while (f.available() && out.size() < kMaxRecords) {
+    String line = f.readStringUntil('\n');
+    if (line.startsWith("name:")) {
+      String nm = line.substring(5);
+      nm.trim();
+      out.push_back({nm, pos});
+    }
+    pos = f.position();
+  }
+  f.close();
+  return true;
+}
+
+bool libSend(const String& relFile, uint32_t offset) {
+  String path = String(FLIPPER_DIR) + "/" + relFile;
+  File f = SD.open(path, FILE_READ);
+  if (!f) return false;
+  f.seek(offset);
+  IrFlip::Record rec;
+  IrFlip::Reader r([&f](std::string& o) -> bool {
+    if (!f.available()) return false;
+    o = f.readStringUntil('\n').c_str();
+    return true;
+  });
+  bool ok = r.next(rec);
+  f.close();
+  if (!ok) return false;
+  return sendRecord(rec);
+}
+
 void setup() {
   setTouchButtonInputEnabled(true);
   s_send.begin();
