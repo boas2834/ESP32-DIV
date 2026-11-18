@@ -296,6 +296,24 @@ void redrawButtons() {
   drawStatusLine();
 }
 
+// Held UP/DOWN auto-repeat for list scrolling (see the same helper in ir.cpp):
+// returns -1/+1 on first press, then repeatedly while held (after a short delay,
+// faster on a long hold). 0 when no step should happen this pass.
+int listStep() {
+  static int dir = 0;
+  static uint32_t downAt = 0, lastRep = 0;
+  const bool up = isButtonPressed(BTN_UP)   || isTouchNavButtonPressed(BTN_UP);
+  const bool dn = isButtonPressed(BTN_DOWN) || isTouchNavButtonPressed(BTN_DOWN);
+  const int d = up ? -1 : (dn ? 1 : 0);
+  const uint32_t now = millis();
+  if (d == 0) { dir = 0; return 0; }
+  if (d != dir) { dir = d; downAt = now; lastRep = now; return d; }
+  if (now - downAt < 400) return 0;
+  const uint32_t interval = (now - downAt > 2000) ? 45 : 110;
+  if (now - lastRep >= interval) { lastRep = now; return d; }
+  return 0;
+}
+
 } // anonymous namespace
 
 // ---- Reusable library API (see ir_flipper.h) -----------------------------
@@ -402,8 +420,9 @@ void loop() {
   // works by touch or by button. The center/SELECT button now Opens/Sends (it
   // is no longer a blanket feature-exit); LEFT goes up a level and exits at the
   // top folder.
-  bool up  = isButtonPressedEdge(BTN_UP);
-  bool dn  = isButtonPressedEdge(BTN_DOWN);
+  int  step = listStep();                         // held UP/DOWN auto-repeats
+  bool up  = (step < 0);
+  bool dn  = (step > 0);
   bool rRight = isButtonPressedEdge(BTN_RIGHT);
   bool rSel   = isButtonPressedEdge(BTN_SELECT);  // evaluate both to consume edges
   bool r   = rRight || rSel;

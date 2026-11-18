@@ -3103,7 +3103,7 @@ static void loadFlipDir() {
   s_flipKids.push_back({String(kFlipSearchTag), true});
   s_flipNames.push_back(s_flipQuery.length()
                           ? (String("[Suche: ") + s_flipQuery + "]  (X)")
-                          : String("[Hersteller suchen]"));
+                          : String("[Suchen]"));
 
   if (s_flipDir.length()) { s_flipKids.push_back({String(".."), true}); s_flipNames.push_back(".."); }
 
@@ -3120,7 +3120,7 @@ static void loadFlipDir() {
 // Open the on-screen keyboard to set/replace the manufacturer filter.
 static void openFlipSearch() {
   OnScreenKeyboardConfig cfg{};
-  cfg.titleLine1 = "Hersteller suchen";
+  cfg.titleLine1 = "Suchen";
   cfg.titleLine2 = "^ caps, # sym";
   osKeyboardUseStandardLayout(cfg);
   cfg.maxLen = 24;
@@ -3276,14 +3276,10 @@ static void handleUniversalNavButtons() {
     return;
   }
 
+  // UP/DOWN in browse screens are handled by the auto-repeat listStep() in
+  // loop(); here we only take LEFT (back) and RIGHT (select).
   if (isTouchNavButtonPressedEdge(BTN_LEFT)) {
     browseBack();
-  }
-  if (isTouchNavButtonPressedEdge(BTN_DOWN)) {
-    bumpBrowseSelection(1);
-  }
-  if (isTouchNavButtonPressedEdge(BTN_UP)) {
-    bumpBrowseSelection(-1);
   }
   if (isTouchNavButtonPressedEdge(BTN_RIGHT)) {
     browseSelect();
@@ -3300,6 +3296,24 @@ void setup() {
   refreshProfiles();
   rebuildCategoriesAndBrands();
   drawAll();
+}
+
+// Held UP/DOWN auto-repeat for list scrolling: returns -1/+1 on the initial
+// press and then, while the button stays held, repeatedly (after a short delay,
+// speeding up on a long hold). 0 when nothing should step this pass.
+static int listStep() {
+  static int dir = 0;
+  static uint32_t downAt = 0, lastRep = 0;
+  const bool up = isButtonPressed(BTN_UP)   || isTouchNavButtonPressed(BTN_UP);
+  const bool dn = isButtonPressed(BTN_DOWN) || isTouchNavButtonPressed(BTN_DOWN);
+  const int d = up ? -1 : (dn ? 1 : 0);
+  const uint32_t now = millis();
+  if (d == 0) { dir = 0; return 0; }
+  if (d != dir) { dir = d; downAt = now; lastRep = now; return d; }  // first step
+  if (now - downAt < 400) return 0;                 // delay before auto-repeat
+  const uint32_t interval = (now - downAt > 2000) ? 45 : 110;  // speed up on long hold
+  if (now - lastRep >= interval) { lastRep = now; return d; }
+  return 0;
 }
 
 void loop() {
@@ -3324,6 +3338,13 @@ void loop() {
     browseSelect();
   }
 
+  // Held UP/DOWN scrolls the list automatically (browse screens only; on the
+  // Remote screen UP/DOWN are reload/volume, handled below).
+  if (s_screen != Screen::Remote) {
+    int st = listStep();
+    if (st) bumpBrowseSelection(st);
+  }
+
   const uint32_t now = millis();
   static uint32_t lastBtnMs = 0;
   static bool prevLeft = false, prevRight = false, prevUp = false, prevDown = false;
@@ -3339,12 +3360,9 @@ void loop() {
       else if (upNow && !prevUp) { sendKey(VolUp); lastBtnMs = now; }
       else if (downNow && !prevDown) { sendKey(VolDn); lastBtnMs = now; }
     } else {
-      // Browse screens (Category/Brand/Profile/FlipBrowse): reuse the same
-      // handlers as the touch nav bar so every screen (incl. the Flipper
-      // library and its synthetic category) behaves identically.
-      if (upNow && !prevUp) { bumpBrowseSelection(-1); lastBtnMs = now; }
-      else if (downNow && !prevDown) { bumpBrowseSelection(1); lastBtnMs = now; }
-      else if (leftNow && !prevLeft) { browseBack(); lastBtnMs = now; }
+      // Browse screens: UP/DOWN handled by listStep() (auto-repeat) above; here
+      // only LEFT (back) and RIGHT (select). Same handlers as the touch nav bar.
+      if (leftNow && !prevLeft) { browseBack(); lastBtnMs = now; }
       else if (rightNow && !prevRight) { browseSelect(); lastBtnMs = now; }
     }
   }
